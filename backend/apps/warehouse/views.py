@@ -1,25 +1,56 @@
 """
 仓库管理视图
 """
+import hashlib
+import json
 import logging
 import io
+import uuid
+from decimal import Decimal
+from django.db import transaction
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    Investigation, DestructionPlan, DestructionPlanItem,
+    DestructionStageSnapshot, DestructionCorrection,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    InvestigationSerializer, InvestigationCreateSerializer,
+    DestructionPlanSerializer, DestructionPlanCreateSerializer,
+    DestructionSnapshotSerializer,
+    DestructionCorrectionSerializer, DestructionCorrectionCreateSerializer,
 )
 
 logger = logging.getLogger('apps')
+
+
+def _first_error(errors):
+    """从序列化器错误中提取第一条错误信息"""
+    if isinstance(errors, dict):
+        for value in errors.values():
+            message = _first_error(value)
+            if message:
+                return message
+    elif isinstance(errors, list):
+        for value in errors:
+            message = _first_error(value)
+            if message:
+                return message
+    else:
+        return str(errors)
+    return ''
 
 
 # ==================== 单位管理 ====================
@@ -628,7 +659,7 @@ class WarningListView(APIView):
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'list': [],
@@ -636,3 +667,454 @@ class ApprovalListView(APIView):
             'page': 1,
             'page_size': 10
         })
+
+
+# ==================== 销毁管理 ====================
+
+def _destruction_blockers(goods, item):
+    """检查物资当前不满足销毁条件的原因，返回空列表表示可以销毁"""
+    problems = []
+    today = timezone.now().date()
+    if goods.custody_until is None:
+        problems.append('保管期限未设定')
+    elif goods.custody_until > today:
+        problems.append('保管期限未届满')
+    if goods.is_frozen:
+        problems.append('物资处于冻结状态')
+    if goods.investigations.filter(status='open').exists():
+        problems.append('存在未结调查')
+    if goods.stock_outs.filter(status__in=['pending', 'approved']).exists():
+        problems.append('存在未完成的领用记录')
+    if item.quantity > goods.quantity:
+        problems.append('库存数量不足')
+    return problems
+
+
+def _save_plan_snapshot(plan, stage, user):
+    """保存指定阶段当时的清单摘要及摘要值"""
+    items = list(plan.items.select_related('goods').order_by('id'))
+    item_summaries = [
+        {
+            'item_id': item.id,
+            'goods_code': item.goods.code,
+            'goods_name': item.goods.name,
+            'quantity': str(item.quantity),
+            'status': item.status,
+        }
+        for item in items
+    ]
+    summary = {
+        'plan_no': plan.plan_no,
+        'stage': stage,
+        'plan_status': plan.status,
+        'item_count': len(item_summaries),
+        'total_quantity': str(sum((item.quantity for item in items), Decimal('0'))),
+        'items': item_summaries,
+    }
+    digest = hashlib.sha256(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    return DestructionStageSnapshot.objects.create(
+        plan=plan, stage=stage, summary=summary, digest=digest, created_by=user
+    )
+
+
+class GoodsFreezeView(APIView):
+    """货物冻结/解冻视图"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            goods = Goods.objects.get(pk=pk)
+        except Goods.DoesNotExist:
+            return error_response(message='货物不存在', code=404)
+
+        frozen = request.data.get('frozen')
+        if not isinstance(frozen, bool):
+            return error_response(message='请指定冻结状态（frozen: true/false）')
+        reason = str(request.data.get('reason', '')).strip()
+        if frozen and not reason:
+            return error_response(message='请填写冻结原因')
+
+        goods.is_frozen = frozen
+        goods.freeze_reason = reason if frozen else ''
+        goods.save(update_fields=['is_frozen', 'freeze_reason', 'updated_at'])
+
+        logger.info(f"User {request.user.username} {'froze' if frozen else 'unfroze'} goods {goods.code}")
+
+        return success_response(
+            data=GoodsSerializer(goods).data,
+            message='冻结成功' if frozen else '解冻成功'
+        )
+
+
+class InvestigationListView(APIView):
+    """调查记录列表视图"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = Investigation.objects.all().order_by('-opened_at')
+
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        serializer = InvestigationSerializer(queryset[start:end], many=True)
+
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
+        })
+
+    def post(self, request):
+        """调查立案"""
+        serializer = InvestigationCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer.errors) or '参数校验失败')
+
+        investigation = Investigation.objects.create(
+            goods_id=serializer.validated_data['goods'],
+            title=serializer.validated_data['title'],
+            remark=serializer.validated_data['remark'],
+            opened_by=request.user
+        )
+
+        logger.info(f"User {request.user.username} opened investigation {investigation.id} on goods {investigation.goods_id}")
+
+        return success_response(data=InvestigationSerializer(investigation).data, message='立案成功')
+
+
+class InvestigationCloseView(APIView):
+    """调查结案视图"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            investigation = Investigation.objects.get(pk=pk)
+        except Investigation.DoesNotExist:
+            return error_response(message='调查记录不存在', code=404)
+
+        if investigation.status == 'closed':
+            return error_response(message='调查已结案')
+
+        investigation.status = 'closed'
+        investigation.closed_by = request.user
+        investigation.closed_at = timezone.now()
+        investigation.save(update_fields=['status', 'closed_by', 'closed_at'])
+
+        logger.info(f"User {request.user.username} closed investigation {investigation.id}")
+
+        return success_response(data=InvestigationSerializer(investigation).data, message='结案成功')
+
+
+class DestructionPlanListView(APIView):
+    """销毁计划列表视图"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = DestructionPlan.objects.all().order_by('-created_at')
+
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        serializer = DestructionPlanSerializer(queryset[start:end], many=True)
+
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
+        })
+
+    def post(self, request):
+        """创建销毁计划（第一阶段：销毁计划）"""
+        serializer = DestructionPlanCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer.errors) or '参数校验失败')
+
+        with transaction.atomic():
+            plan = DestructionPlan.objects.create(
+                plan_no=uuid.uuid4().hex[:30],
+                title=serializer.validated_data['title'],
+                remark=serializer.validated_data['remark'],
+                created_by=request.user
+            )
+            plan.plan_no = f"DEST-{timezone.now():%Y%m%d}-{plan.pk:04d}"
+            plan.save(update_fields=['plan_no'])
+            DestructionPlanItem.objects.bulk_create([
+                DestructionPlanItem(
+                    plan=plan,
+                    goods_id=item['goods'],
+                    quantity=item['quantity'],
+                    reason=item['reason'],
+                    method=item['method'],
+                    remark=item['remark']
+                )
+                for item in serializer.validated_data['items']
+            ])
+            _save_plan_snapshot(plan, 'plan', request.user)
+
+        logger.info(f"User {request.user.username} created destruction plan {plan.plan_no}")
+
+        return success_response(data=DestructionPlanSerializer(plan).data, message='创建成功')
+
+
+class DestructionPlanDetailView(APIView):
+    """销毁计划详情视图"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        return success_response(data={
+            'plan': DestructionPlanSerializer(plan).data,
+            'snapshots': DestructionSnapshotSerializer(plan.snapshots.all(), many=True).data,
+            'corrections': DestructionCorrectionSerializer(plan.corrections.all(), many=True).data,
+        })
+
+
+class DestructionPlanReviewView(APIView):
+    """销毁资格复核视图（第二阶段：资格复核）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        if plan.status != 'planning':
+            return error_response(message=f'当前状态（{plan.get_status_display()}）不允许复核')
+
+        remark = str(request.data.get('remark', '')).strip()
+        results = []
+
+        with transaction.atomic():
+            items = plan.items.select_related('goods').filter(status='pending').order_by('id')
+            for item in items:
+                problems = _destruction_blockers(item.goods, item)
+                if problems:
+                    item.status = 'ineligible'
+                    item.review_note = '；'.join(problems)
+                else:
+                    item.status = 'eligible'
+                    item.review_note = '复核通过'
+                item.save(update_fields=['status', 'review_note', 'updated_at'])
+                results.append({
+                    'item': item.id,
+                    'goods_code': item.goods.code,
+                    'status': item.status,
+                    'note': item.review_note
+                })
+
+            plan.status = 'reviewed'
+            plan.reviewed_by = request.user
+            plan.reviewed_at = timezone.now()
+            plan.review_remark = remark
+            plan.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'review_remark', 'updated_at'])
+            _save_plan_snapshot(plan, 'review', request.user)
+
+        logger.info(f"User {request.user.username} reviewed destruction plan {plan.plan_no}")
+
+        return success_response(data={
+            'plan': DestructionPlanSerializer(plan).data,
+            'results': results
+        }, message='复核完成')
+
+
+class DestructionPlanApproveView(APIView):
+    """销毁批准视图（第三阶段：批准）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        if plan.status != 'reviewed':
+            return error_response(message=f'当前状态（{plan.get_status_display()}）不允许批准')
+
+        decision = request.data.get('decision')
+        if decision not in ('approved', 'rejected'):
+            return error_response(message='请指定批准结论（decision: approved/rejected）')
+        remark = str(request.data.get('remark', '')).strip()
+
+        if decision == 'approved' and not plan.items.filter(status='eligible').exists():
+            return error_response(message='没有复核通过的明细，无法批准')
+
+        with transaction.atomic():
+            plan.status = decision
+            plan.approved_by = request.user
+            plan.approved_at = timezone.now()
+            plan.approve_remark = remark
+            plan.save(update_fields=['status', 'approved_by', 'approved_at', 'approve_remark', 'updated_at'])
+            _save_plan_snapshot(plan, 'approve', request.user)
+
+        logger.info(f"User {request.user.username} {decision} destruction plan {plan.plan_no}")
+
+        return success_response(
+            data=DestructionPlanSerializer(plan).data,
+            message='批准成功' if decision == 'approved' else '已驳回'
+        )
+
+
+class DestructionPlanExecuteView(APIView):
+    """销毁执行确认视图（第四阶段：执行确认，执行后进入不可逆终态）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        if plan.status != 'approved':
+            return error_response(message=f'当前状态（{plan.get_status_display()}）不允许执行')
+
+        results = []
+        # 每条明细在独立事务中处理：单项失败不会波及其他明细，每项都有明确结果
+        for item in plan.items.filter(status='eligible').order_by('id'):
+            try:
+                with transaction.atomic():
+                    locked = DestructionPlanItem.objects.select_for_update().get(pk=item.pk)
+                    if locked.status != 'eligible':
+                        results.append({
+                            'item': locked.id,
+                            'status': locked.status,
+                            'note': '明细状态已变化，跳过执行'
+                        })
+                        continue
+                    goods = Goods.objects.select_for_update().get(pk=locked.goods_id)
+                    # 执行前再次核查冻结、未结调查与领用状态
+                    problems = _destruction_blockers(goods, locked)
+                    if problems:
+                        locked.status = 'blocked'
+                        locked.execute_note = '；'.join(problems)
+                    else:
+                        goods.quantity -= locked.quantity
+                        goods.save(update_fields=['quantity', 'updated_at'])
+                        locked.status = 'destroyed'
+                        locked.destroyed_at = timezone.now()
+                        locked.execute_note = '执行完成'
+                    locked.save(update_fields=['status', 'execute_note', 'destroyed_at', 'updated_at'])
+                    results.append({
+                        'item': locked.id,
+                        'goods_code': goods.code,
+                        'status': locked.status,
+                        'note': locked.execute_note
+                    })
+            except Exception as exc:
+                logger.exception(f"Destruction plan {plan.plan_no} item {item.id} execution failed")
+                # 在独立事务中将该项标记为失败，不影响其他明细的处理结果
+                with transaction.atomic():
+                    locked = DestructionPlanItem.objects.get(pk=item.pk)
+                    locked.status = 'failed'
+                    locked.execute_note = f'处理异常：{exc}'[:300]
+                    locked.save(update_fields=['status', 'execute_note', 'updated_at'])
+                results.append({
+                    'item': locked.id,
+                    'status': 'failed',
+                    'note': locked.execute_note
+                })
+
+        with transaction.atomic():
+            plan.status = 'executed'
+            plan.executed_by = request.user
+            plan.executed_at = timezone.now()
+            plan.save(update_fields=['status', 'executed_by', 'executed_at', 'updated_at'])
+            _save_plan_snapshot(plan, 'execute', request.user)
+
+        destroyed_count = sum(1 for r in results if r['status'] == 'destroyed')
+        blocked_count = sum(1 for r in results if r['status'] == 'blocked')
+        failed_count = sum(1 for r in results if r['status'] == 'failed')
+
+        logger.info(
+            f"User {request.user.username} executed destruction plan {plan.plan_no}: "
+            f"destroyed={destroyed_count} blocked={blocked_count} failed={failed_count}"
+        )
+
+        return success_response(data={
+            'plan': DestructionPlanSerializer(plan).data,
+            'results': results,
+            'destroyed_count': destroyed_count,
+            'blocked_count': blocked_count,
+            'failed_count': failed_count
+        }, message=f'执行完成：销毁 {destroyed_count} 项，拦截 {blocked_count} 项，失败 {failed_count} 项')
+
+
+class DestructionCorrectionListView(APIView):
+    """销毁更正视图（仅修改元数据，不恢复库存）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        serializer = DestructionCorrectionSerializer(plan.corrections.all(), many=True)
+        return success_response(data=serializer.data)
+
+    def post(self, request, pk):
+        try:
+            plan = DestructionPlan.objects.get(pk=pk)
+        except DestructionPlan.DoesNotExist:
+            return error_response(message='销毁计划不存在', code=404)
+
+        if plan.status != 'executed':
+            return error_response(message='仅已执行的销毁计划可以提交更正')
+
+        serializer = DestructionCorrectionCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer.errors) or '参数校验失败')
+
+        try:
+            item = plan.items.get(pk=serializer.validated_data['item'])
+        except DestructionPlanItem.DoesNotExist:
+            return error_response(message='销毁明细不存在', code=404)
+        if item.status != 'destroyed':
+            return error_response(message='仅已销毁的明细可以更正')
+
+        changes = serializer.validated_data['changes']
+        with transaction.atomic():
+            before_after = {}
+            for field, new_value in changes.items():
+                before_after[field] = {'old': getattr(item, field), 'new': new_value}
+                setattr(item, field, new_value)
+            item.save(update_fields=list(changes.keys()) + ['updated_at'])
+            correction = DestructionCorrection.objects.create(
+                plan=plan,
+                item=item,
+                changes=before_after,
+                reason=serializer.validated_data['reason'],
+                created_by=request.user
+            )
+
+        logger.info(
+            f"User {request.user.username} corrected destruction plan {plan.plan_no} "
+            f"item {item.id}: {list(changes.keys())}"
+        )
+
+        return success_response(data=DestructionCorrectionSerializer(correction).data, message='更正成功')
