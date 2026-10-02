@@ -2,6 +2,7 @@
 库房管理模型
 """
 from django.db import models
+from django.utils import timezone
 from apps.authentication.models import User
 
 
@@ -99,8 +100,13 @@ class Variety(models.Model):
 
 class Goods(models.Model):
     """货物模型"""
+    LIFECYCLE_CHOICES = [
+        ('in_custody', '在库'),
+        ('destroyed', '已销毁'),
+    ]
+
     variety = models.ForeignKey(
-        Variety, on_delete=models.CASCADE,
+        Variety, on_delete=models.PROTECT,
         related_name='goods', verbose_name='所属品种'
     )
     name = models.CharField('货物名称', max_length=200)
@@ -109,24 +115,107 @@ class Goods(models.Model):
     quantity = models.DecimalField('库存数量', max_digits=12, decimal_places=2, default=0)
     warning_threshold = models.DecimalField('预警阈值', max_digits=12, decimal_places=2, default=10)
     location = models.CharField('存放位置', max_length=100, blank=True)
+    retention_expire_date = models.DateField('保管期限届满日', null=True, blank=True)
+    lifecycle_status = models.CharField(
+        '生命周期状态', max_length=20, choices=LIFECYCLE_CHOICES, default='in_custody'
+    )
     remark = models.TextField('备注', blank=True)
     is_active = models.BooleanField('是否启用', default=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
     updated_at = models.DateTimeField('更新时间', auto_now=True)
-    
+
     class Meta:
         db_table = 'wh_goods'
         verbose_name = '货物'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return self.name
-    
+
     @property
     def is_warning(self):
         """是否预警"""
         return self.quantity <= self.warning_threshold
+
+    @property
+    def is_destroyed(self):
+        """是否已进入销毁终态（不可逆）"""
+        return self.lifecycle_status == 'destroyed'
+
+    @property
+    def is_retention_expired(self):
+        """保管期限是否已届满"""
+        if not self.retention_expire_date:
+            return False
+        return self.retention_expire_date <= timezone.localdate()
+
+    @property
+    def is_frozen(self):
+        """当前是否存在生效中的冻结"""
+        return self.holds.filter(
+            hold_type='freeze', status='active'
+        ).exists()
+
+    @property
+    def has_open_investigation(self):
+        """当前是否存在未结调查"""
+        return self.holds.filter(
+            hold_type='investigation', status='active'
+        ).exists()
+
+    @property
+    def has_open_stock_out(self):
+        """当前是否存在未结领用（待审批或已批准但未完成出库）"""
+        return self.stock_outs.filter(status__in=['pending', 'approved']).exists()
+
+
+class GoodsHold(models.Model):
+    """物资管控记录（冻结 / 未结调查）"""
+    HOLD_TYPE_CHOICES = [
+        ('freeze', '冻结'),
+        ('investigation', '未结调查'),
+    ]
+    STATUS_CHOICES = [
+        ('active', '生效中'),
+        ('released', '已解除'),
+    ]
+
+    goods = models.ForeignKey(
+        Goods, on_delete=models.CASCADE,
+        related_name='holds', verbose_name='货物'
+    )
+    hold_type = models.CharField('管控类型', max_length=20, choices=HOLD_TYPE_CHOICES)
+    reason = models.TextField('发起原因', blank=True)
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='active')
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='goods_holds', verbose_name='发起人'
+    )
+    released_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='released_goods_holds', verbose_name='解除人'
+    )
+    release_reason = models.TextField('解除原因', blank=True)
+    created_at = models.DateTimeField('发起时间', auto_now_add=True)
+    released_at = models.DateTimeField('解除时间', null=True, blank=True)
+
+    class Meta:
+        db_table = 'wh_goods_hold'
+        verbose_name = '物资管控记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.goods.name} - {self.get_hold_type_display()} - {self.get_status_display()}"
+
+    def release(self, operator, reason=''):
+        """解除管控"""
+        self.status = 'released'
+        self.released_by = operator
+        self.release_reason = reason
+        self.released_at = timezone.now()
+        self.save(update_fields=['status', 'released_by', 'release_reason', 'released_at'])
 
 
 class StockIn(models.Model):

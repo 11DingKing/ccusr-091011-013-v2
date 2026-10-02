@@ -2,7 +2,7 @@
 仓库管理序列化器
 """
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval, GoodsHold
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -136,13 +136,21 @@ class GoodsSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='variety.category.name', read_only=True)
     unit_name = serializers.CharField(source='variety.category.unit.name', read_only=True)
     is_warning = serializers.BooleanField(read_only=True)
-    
+    is_destroyed = serializers.BooleanField(read_only=True)
+    is_retention_expired = serializers.BooleanField(read_only=True)
+    is_frozen = serializers.BooleanField(read_only=True)
+    has_open_investigation = serializers.BooleanField(read_only=True)
+    has_open_stock_out = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = Goods
         fields = [
             'id', 'name', 'code', 'variety', 'variety_name',
             'category_name', 'unit_name', 'specification',
             'quantity', 'warning_threshold', 'location',
+            'retention_expire_date', 'lifecycle_status',
+            'is_destroyed', 'is_retention_expired',
+            'is_frozen', 'has_open_investigation', 'has_open_stock_out',
             'remark', 'is_active', 'is_warning',
             'created_at', 'updated_at'
         ]
@@ -193,10 +201,69 @@ class ApprovalSerializer(serializers.ModelSerializer):
     """审批记录序列化器"""
     approver_name = serializers.CharField(source='approver.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = Approval
         fields = [
             'id', 'stock_out', 'approver', 'approver_name',
             'status', 'status_display', 'remark', 'created_at', 'updated_at'
         ]
+
+
+class GoodsCreateSerializer(serializers.Serializer):
+    """货物创建/更新序列化器"""
+    name = serializers.CharField(max_length=200, required=True)
+    code = serializers.CharField(max_length=50, required=True)
+    variety = serializers.IntegerField(required=True)
+    specification = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
+    warning_threshold = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=10)
+    location = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    retention_expire_date = serializers.DateField(required=False, allow_null=True, default=None)
+    remark = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_code(self, value):
+        instance = self.context.get('instance')
+        qs = Goods.objects.filter(code=value)
+        if instance:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('货物编码已存在')
+        return value
+
+    def validate_variety(self, value):
+        if not Variety.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('品种不存在')
+        return value
+
+
+class GoodsHoldSerializer(serializers.ModelSerializer):
+    """物资管控记录序列化器"""
+    hold_type_display = serializers.CharField(source='get_hold_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    released_by_name = serializers.CharField(source='released_by.username', read_only=True)
+
+    class Meta:
+        model = GoodsHold
+        fields = [
+            'id', 'goods', 'hold_type', 'hold_type_display',
+            'reason', 'status', 'status_display',
+            'created_by', 'created_by_name',
+            'released_by', 'released_by_name', 'release_reason',
+            'created_at', 'released_at',
+        ]
+        read_only_fields = ['id', 'status', 'created_by', 'released_by',
+                            'release_reason', 'created_at', 'released_at']
+
+
+class GoodsHoldCreateSerializer(serializers.Serializer):
+    """发起冻结/调查管控"""
+    hold_type = serializers.ChoiceField(choices=[('freeze', '冻结'), ('investigation', '未结调查')],
+                                        required=True)
+    reason = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class GoodsHoldReleaseSerializer(serializers.Serializer):
+    """解除管控"""
+    reason = serializers.CharField(required=False, allow_blank=True, default='')

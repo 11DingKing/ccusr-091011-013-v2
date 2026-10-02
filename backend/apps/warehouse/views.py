@@ -10,12 +10,17 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    GoodsHold,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, GoodsCreateSerializer,
+    GoodsHoldSerializer, GoodsHoldCreateSerializer, GoodsHoldReleaseSerializer,
+    StockInSerializer, StockOutSerializer,
     WarningSerializer, ApprovalSerializer
 )
 
@@ -574,16 +579,174 @@ class DashboardView(APIView):
 
 
 class GoodsListView(APIView):
-    """货物列表视图"""
+    """货物列表 / 新建货物"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety__category__unit').all().order_by('-created_at')
+
+        lifecycle = request.query_params.get('lifecycle_status')
+        if lifecycle:
+            queryset = queryset.filter(lifecycle_status=lifecycle)
+        is_active = request.query_params.get('is_active')
+        if is_active in ('true', 'false'):
+            queryset = queryset.filter(is_active=(is_active == 'true'))
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(name__icontains=keyword) | \
+                queryset.filter(code__icontains=keyword)
+
+        try:
+            page = max(int(request.query_params.get('page', 1)), 1)
+            page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        except (TypeError, ValueError):
+            page, page_size = 1, 10
+
+        total = queryset.count()
+        goods = queryset[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': GoodsSerializer(goods, many=True).data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        serializer = GoodsCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        goods = Goods.objects.create(
+            variety_id=data['variety'],
+            name=data['name'],
+            code=data['code'],
+            specification=data.get('specification', ''),
+            quantity=data.get('quantity', 0),
+            warning_threshold=data.get('warning_threshold', 10),
+            location=data.get('location', ''),
+            retention_expire_date=data.get('retention_expire_date'),
+            remark=data.get('remark', ''),
+        )
+        logger.info("用户 %s 新建货物 %s", request.user.username, goods.code)
+        return success_response(data=GoodsSerializer(goods).data, message='创建成功')
+
+
+class GoodsDetailView(APIView):
+    """货物详情 / 更新（销毁终态物资仅允许更新少量元数据，库存与终态不可改）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        goods = Goods.objects.select_related('variety__category__unit').filter(pk=pk).first()
+        if goods is None:
+            return error_response(message='货物不存在', code=404)
+        return success_response(data=GoodsSerializer(goods).data)
+
+    def put(self, request, pk):
+        goods = Goods.objects.filter(pk=pk).first()
+        if goods is None:
+            return error_response(message='货物不存在', code=404)
+
+        serializer = GoodsCreateSerializer(
+            data=request.data, context={'instance': goods})
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        if goods.is_destroyed:
+            return error_response(
+                message='物资已销毁，库存与生命周期状态不可修改；如属录入错误请通过销毁更正流程处理')
+
+        goods.variety_id = data['variety']
+        goods.name = data['name']
+        goods.code = data['code']
+        goods.specification = data.get('specification', '')
+        goods.quantity = data.get('quantity', goods.quantity)
+        goods.warning_threshold = data.get('warning_threshold', goods.warning_threshold)
+        goods.location = data.get('location', '')
+        goods.retention_expire_date = data.get('retention_expire_date')
+        goods.remark = data.get('remark', '')
+        goods.save()
+        logger.info("用户 %s 更新货物 %s", request.user.username, goods.code)
+        return success_response(data=GoodsSerializer(goods).data, message='更新成功')
+
+
+class GoodsHoldListView(APIView):
+    """物资管控记录列表 / 发起冻结或未结调查"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = GoodsHold.objects.select_related(
+            'goods', 'created_by', 'released_by').all().order_by('-created_at')
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        hold_type = request.query_params.get('hold_type')
+        if hold_type:
+            queryset = queryset.filter(hold_type=hold_type)
+        return success_response(data={
+            'list': GoodsHoldSerializer(queryset, many=True).data,
+            'total': queryset.count(),
+        })
+
+    def post(self, request):
+        serializer = GoodsHoldCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        goods_id = request.data.get('goods')
+        goods = Goods.objects.filter(pk=goods_id).first()
+        if goods is None:
+            return error_response(message='货物不存在', code=404)
+        if goods.is_destroyed:
+            return error_response(message='物资已销毁，无需再发起管控')
+
+        hold_type = serializer.validated_data['hold_type']
+        if GoodsHold.objects.filter(goods=goods, hold_type=hold_type, status='active').exists():
+            label = '冻结' if hold_type == 'freeze' else '未结调查'
+            return error_response(message=f'该物资已存在生效中的{label}')
+
+        hold = GoodsHold.objects.create(
+            goods=goods, hold_type=hold_type,
+            reason=serializer.validated_data.get('reason', ''),
+            created_by=request.user)
+        logger.warning("用户 %s 对货物 %s 发起%s",
+                       request.user.username, goods.code, hold.get_hold_type_display())
+        return success_response(data=GoodsHoldSerializer(hold).data, message='管控已发起')
+
+
+class GoodsHoldReleaseView(APIView):
+    """解除冻结/调查管控"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        hold = GoodsHold.objects.filter(pk=pk).first()
+        if hold is None:
+            return error_response(message='管控记录不存在', code=404)
+        if hold.status != 'active':
+            return error_response(message='该管控已解除，不能重复操作')
+
+        reason = request.data.get('reason', '') if isinstance(request.data, dict) else ''
+        hold.release(request.user, reason=reason)
+        logger.warning("用户 %s 解除货物 %s 的%s",
+                       request.user.username, hold.goods.code, hold.get_hold_type_display())
+        return success_response(data=GoodsHoldSerializer(hold).data, message='管控已解除')
 
 
 class StockInListView(APIView):

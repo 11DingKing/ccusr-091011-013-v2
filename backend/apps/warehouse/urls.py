@@ -7,7 +7,9 @@ from .views import (
     CategoryListView, CategoryDetailView, CategoryBatchDeleteView, CategoryAllView,
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
-    DashboardView, GoodsListView, StockInListView, StockOutListView,
+    DashboardView, GoodsListView, GoodsDetailView,
+    GoodsHoldListView, GoodsHoldReleaseView,
+    StockInListView, StockOutListView,
     WarningListView, ApprovalListView
 )
 
@@ -36,7 +38,13 @@ urlpatterns = [
     
     # 货物管理
     path('goods/', GoodsListView.as_view(), name='goods-list'),
-    
+    path('goods/<int:pk>/', GoodsDetailView.as_view(), name='goods-detail'),
+
+    # 物资管控（冻结 / 未结调查）
+    path('goods-holds/', GoodsHoldListView.as_view(), name='goods-hold-list'),
+    path('goods-holds/<int:pk>/release/', GoodsHoldReleaseView.as_view(),
+         name='goods-hold-release'),
+
     # 入库管理
     path('stock-in/', StockInListView.as_view(), name='stock-in-list'),
     
